@@ -1,0 +1,173 @@
+name: Diagnose iCourse login
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose-login:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install login dependencies
+        run: python -m pip install requests pycryptodome
+      - name: Test login only
+        env:
+          StuId: ${{ secrets.STUID }}
+          UISPsw: ${{ secrets.UISPSW }}
+        run: |
+          python -u - <<'PY'
+          """Login-only diagnostic: never print response bodies, credentials or cookies."""
+          
+          import json
+          import re
+          import time
+          from urllib.parse import urlparse
+          
+          import requests
+          
+          from src.api.webvpn import WebVPNSession, get_vpn_url
+          from src.runtime import config
+          
+          
+          phase = "WebVPN"
+          saw_icourse_auth = False
+          original_request = requests.Session.request
+          message_patterns = {
+              "captcha": r"captcha|verify.?code|验证码|校验码|图形码",
+              "sms_or_otp": r"\bsms\b|\botp\b|短信|动态码|手机验证",
+              "additional_verification": r"\bmfa\b|two.?factor|多因子|二次认证|二次验证|双因素|扫码",
+              "credentials": r"password|credential|用户名|密码|账号|账户",
+              "session_or_expiry": r"session|expired|timeout|会话|过期|失效|超时",
+              "rate_limit": r"rate.?limit|too many|频繁|限流|次数",
+              "access_denied": r"forbidden|denied|permission|拒绝|权限|未授权",
+          }
+          
+          
+          def schema(value, depth=0):
+              """Keep field names and types; never include scalar response values."""
+              if depth >= 4:
+                  return type(value).__name__
+              if isinstance(value, dict):
+                  return {
+                      str(key) if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", str(key)) else "<other-key>":
+                      schema(item, depth + 1)
+                      for key, item in list(value.items())[:24]
+                  }
+              if isinstance(value, list):
+                  return {"list_count": len(value), "first_item_schema": schema(value[0], depth + 1) if value else None}
+              return type(value).__name__
+          
+          
+          def message_mentions(value, depth=0):
+              """Report topic labels, not the server's free-text messages."""
+              found = set()
+              if depth > 4:
+                  return found
+              if isinstance(value, dict):
+                  for key, item in list(value.items())[:24]:
+                      if str(key).lower() in {"message", "msg", "error", "errmsg", "errormsg", "errormessage", "description"} and isinstance(item, str):
+                          for label, pattern in message_patterns.items():
+                              if re.search(pattern, item, flags=re.I):
+                                  found.add(label)
+                      if isinstance(item, (dict, list)):
+                          found.update(message_mentions(item, depth + 1))
+              elif isinstance(value, list):
+                  for item in value[:10]:
+                      found.update(message_mentions(item, depth + 1))
+              return found
+          
+          
+          def destination_kind(url):
+              parsed = urlparse(url)
+              if parsed.hostname == urlparse(config.WEBVPN_BASE).hostname:
+                  return "webvpn_login" if parsed.path.rstrip("/") == "/login" else "webvpn_other"
+              if parsed.hostname == urlparse(config.IDP_BASE).hostname:
+                  return "university_idp"
+              if parsed.hostname == urlparse(config.ICOURSE_BASE).hostname:
+                  return "icourse"
+              return "other"
+          
+          
+          def traced_request(session, method, url, **kwargs):
+              global saw_icourse_auth
+              path = urlparse(url).path.rstrip("/")
+              endpoint = next((name for name in ("authExecute", "queryAuthMethods", "getJsPublicKey", "authnEngine", "infosimple") if path.endswith("/" + name)), None)
+              if endpoint is None and urlparse(url).hostname == urlparse(config.WEBVPN_BASE).hostname and not path:
+                  endpoint = "webvpn_portal"
+              started = time.monotonic()
+              try:
+                  response = original_request(session, method, url, **kwargs)
+              except requests.RequestException as error:
+                  if endpoint:
+                      print("[diagnostic] " + json.dumps({"phase": phase, "endpoint": endpoint, "exception_type": type(error).__name__}), flush=True)
+                  raise
+              if endpoint:
+                  if phase == "iCourse" and endpoint == "authExecute":
+                      saw_icourse_auth = True
+                  record = {
+                      "phase": phase,
+                      "endpoint": endpoint,
+                      "http_status": response.status_code,
+                      "seconds": round(time.monotonic() - started, 2),
+                      "redirect_count": len(response.history),
+                      "destination_kind": destination_kind(response.url),
+                  }
+                  try:
+                      data = response.json()
+                  except ValueError:
+                      record["response_format"] = "not_json"
+                  else:
+                      record["response_schema"] = schema(data)
+                      record["message_mentions"] = sorted(message_mentions(data))
+                      if isinstance(data, dict):
+                          code = str(data.get("code", ""))
+                          record["business_code"] = code if re.fullmatch(r"-?\d{1,6}", code) else "absent_or_non_numeric"
+                          record["top_level_login_token_present"] = bool(data.get("loginToken"))
+                          nested = data.get("data")
+                          record["nested_login_token_present"] = bool(nested.get("loginToken")) if isinstance(nested, dict) else False
+                  print("[diagnostic] " + json.dumps(record, ensure_ascii=True), flush=True)
+              return response
+          
+          
+          requests.Session.request = traced_request
+          
+          if not config.STUDENT_ID or not config.PASSWORD:
+              print("[result] Required STUID or UISPSW repository secret is missing.")
+              raise SystemExit(1)
+          
+          success = False
+          for attempt in range(1, 4):
+              vpn = WebVPNSession()
+              saw_icourse_auth = False
+              phase = "WebVPN"
+              print(f"[diagnostic] Login attempt {attempt}/3", flush=True)
+              try:
+                  vpn.login()
+                  phase = "iCourse"
+                  vpn.authenticate_icourse()
+                  response = vpn.session.get(get_vpn_url(config.ICOURSE_BASE + "/userapi/v1/infosimple"), timeout=30)
+                  payload = response.json()
+                  success = response.status_code == 200 and isinstance(payload, dict) and payload.get("code") in (0, 200)
+                  print("[result] " + ("iCourse login verified by API." if success else "iCourse API did not confirm login."), flush=True)
+                  break
+              except Exception as error:
+                  # Existing exceptions can include URLs containing temporary credentials.
+                  print(f"[result] Login stopped in {phase}; exception_type={type(error).__name__}", flush=True)
+                  if saw_icourse_auth:
+                      print("[result] Captured iCourse authentication response metadata; stopping retries.", flush=True)
+                      break
+              finally:
+                  vpn.session.close()
+              if attempt < 3:
+                  time.sleep(5)
+          
+          print("[result] Login-only check finished. Course processing and email were not run.", flush=True)
+          raise SystemExit(0 if success else 1)
+          PY
