@@ -1,7 +1,7 @@
+import hashlib
 import re
 import smtplib
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from io import BytesIO
@@ -11,7 +11,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
 from html import escape
-from email.utils import formataddr
+from email.utils import formataddr, formatdate, make_msgid
 from urllib.parse import quote
 
 import markdown
@@ -107,6 +107,9 @@ ul, ol { padding-left: 24px; }
 li { margin-bottom: 4px; }
 """
 
+# Gmail counts inline MIME images as attachments; reserve room below its 500-part limit.
+_MAX_INLINE_IMAGES = 400
+
 _MIN_INLINE_HEIGHT = 13  # minimum logical height for inline formulas (px)
 
 _IMAGE_CACHE: dict[str, tuple] = {}
@@ -144,7 +147,7 @@ def _prefetch_latex_images(urls: list[str], dpi: int = 300) -> None:
     Results are stored in ``_IMAGE_CACHE`` so that subsequent calls to
     ``_fetch_latex_image`` become instant cache hits.
     """
-    uncached = [u for u in urls if u not in _IMAGE_CACHE]
+    uncached = [u for u in dict.fromkeys(urls) if u not in _IMAGE_CACHE]
     if not uncached:
         return
     with ThreadPoolExecutor(max_workers=min(len(uncached), 8)) as pool:
@@ -153,19 +156,8 @@ def _prefetch_latex_images(urls: list[str], dpi: int = 300) -> None:
             future.result()  # trigger any exception logging inside _fetch_latex_image
 
 
-def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
-    """Convert Markdown to styled HTML, rendering LaTeX math as images.
-
-    Processing order: extract LaTeX → markdown convert → restore as <img>.
-    This prevents the markdown engine from corrupting backslash escapes.
-
-    Args:
-        md_text: Markdown source text.
-        cid_images: When provided (dict), download images and embed via CID
-                    references instead of external URLs.  The dict is populated
-                    with {cid_name: png_bytes} entries for the caller to attach
-                    to the MIME message.
-    """
+def _extract_latex(md_text: str) -> tuple[str, dict[str, str]]:
+    """Replace formula occurrences with placeholders and retain their source."""
     latex_map: dict[str, str] = {}
     counter = 0
 
@@ -202,6 +194,42 @@ def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
     # 4) \(...\) inline formulas (normalize to $...$)
     text = re.sub(r"\\\((.+?)\\\)", _stash_inline, text)
 
+    return text, latex_map
+
+
+def email_batches(items: list[dict]) -> list[list[dict]]:
+    """Keep whole lectures together while bounding the number of distinct formulas."""
+    batches = []
+    current = []
+    formulas = set()
+    for item in items:
+        _, placeholders = _extract_latex(item["summary"])
+        incoming = set(placeholders.values())
+        if current and len(formulas | incoming) > _MAX_INLINE_IMAGES:
+            batches.append(current)
+            current = []
+            formulas = set()
+        current.append(item)
+        formulas.update(incoming)
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
+    """Convert Markdown to styled HTML, rendering LaTeX math as images.
+
+    Processing order: extract LaTeX → markdown convert → restore as <img>.
+    This prevents the markdown engine from corrupting backslash escapes.
+
+    Args:
+        md_text: Markdown source text.
+        cid_images: When provided (dict), download images and embed via CID
+                    references instead of external URLs.  The dict is populated
+                    with {cid_name: png_bytes} entries for the caller to attach
+                    to the MIME message.
+    """
+    text, latex_map = _extract_latex(md_text)
     html = markdown.markdown(
         text,
         extensions=_MD_EXTENSIONS,
@@ -222,10 +250,10 @@ def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
 
     for key, (url, latex_content, is_block) in latex_info.items():
         w, h, img_data = _fetch_latex_image(url)
+        src = _resolve_src(url, img_data, cid_images) if w and h else None
 
         if is_block:
-            if w and h:
-                src = _resolve_src(url, img_data, cid_images)
+            if src:
                 img_tag = (
                     f'<div style="text-align:center;margin:16px 0">'
                     f'<img src="{src}" alt="{escape(latex_content)}" '
@@ -240,14 +268,13 @@ def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
                     f'<code>{escape(latex_content)}</code></div>'
                 )
         else:
-            if w and h:
+            if src:
                 # Enforce minimum height so formulas aren't smaller than text
                 if h < _MIN_INLINE_HEIGHT:
                     scale = _MIN_INLINE_HEIGHT / h
                     w = max(1, int(w * scale))
                     h = _MIN_INLINE_HEIGHT
 
-                src = _resolve_src(url, img_data, cid_images)
                 img_tag = (
                     f'<img src="{src}" alt="{escape(latex_content)}" '
                     f'width="{w}" height="{h}" '
@@ -263,13 +290,40 @@ def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
 
 
 def _resolve_src(url: str, img_data: bytes | None,
-                 cid_images: dict | None) -> str:
-    """Return a CID reference if embedding, otherwise the original URL."""
-    if cid_images is not None and img_data:
-        cid = f"latex-{uuid.uuid4().hex[:12]}"
-        cid_images[cid] = img_data
-        return f"cid:{cid}"
-    return url
+                 cid_images: dict | None) -> str | None:
+    if cid_images is None or not img_data:
+        return url
+    cid = "latex-" + hashlib.sha256(img_data).hexdigest()[:32]
+    if cid not in cid_images and len(cid_images) >= _MAX_INLINE_IMAGES:
+        # A single exceptionally dense lecture still includes the original TeX.
+        return None
+    cid_images[cid] = img_data
+    return f"cid:{cid}"
+
+
+def build_html_message(subject: str, sender: str, receiver: str, plain: str,
+                       html: str, cid_images: dict[str, bytes]) -> MIMEMultipart:
+    """Build the same attachment-limited MIME structure for subscriptions and exports."""
+    if len(cid_images) > _MAX_INLINE_IMAGES:
+        raise ValueError("Too many inline images for one email")
+
+    msg = MIMEMultipart("related")
+    msg["Subject"] = subject
+    msg["From"] = formataddr(("iCourse Subscriber", sender))
+    msg["To"] = receiver
+    msg["Date"] = formatdate(usegmt=True)
+    msg["Message-ID"] = make_msgid(domain=sender.rpartition("@")[2] or None)
+
+    alternatives = MIMEMultipart("alternative")
+    alternatives.attach(MIMEText(plain, "plain", "utf-8"))
+    alternatives.attach(MIMEText(html, "html", "utf-8"))
+    msg.attach(alternatives)
+    for cid, data in cid_images.items():
+        image = MIMEImage(data, "png")
+        image.add_header("Content-ID", f"<{cid}>")
+        image.add_header("Content-Disposition", "inline", filename=f"{cid}.png")
+        msg.attach(image)
+    return msg
 
 
 class Emailer:
@@ -282,7 +336,7 @@ class Emailer:
         self.password = config.SMTP_PASSWORD
         self.receiver = config.RECEIVER_EMAIL
 
-    def send(self, items: list[dict]) -> bool:
+    def send(self, items: list[dict], subject_suffix: str = "") -> bool:
         """Send a single email containing all lecture summaries.
 
         LaTeX formulas are rendered as PNG images and embedded directly into
@@ -299,7 +353,7 @@ class Emailer:
                                an inline 更新 badge per affected lecture.
 
         Returns:
-            True if email was sent successfully, False otherwise.
+            True if the outgoing SMTP server accepted the message, False otherwise.
         """
         if not items:
             return True
@@ -316,6 +370,7 @@ class Emailer:
         subject = f"[FiCS] {', '.join(parts)}"
         if any_update:
             subject += "（含 PPT 识别·更新）"
+        subject += subject_suffix
 
         # Plain text (Markdown as-is, readable without rendering)
         plain_sections = []
@@ -385,25 +440,7 @@ class Emailer:
             + "</body></html>"
         )
 
-        # Build MIME: related > alternative > (plain, html) + image attachments
-        msg = MIMEMultipart("related")
-        msg["Subject"] = subject
-        msg["From"] = formataddr(("iCourse Subscriber", self.sender))
-        msg["To"] = self.receiver
-
-        msg_alt = MIMEMultipart("alternative")
-        msg_alt.attach(MIMEText(plain, "plain", "utf-8"))
-        msg_alt.attach(MIMEText(html, "html", "utf-8"))
-        msg.attach(msg_alt)
-
-        # Attach CID images
-        for cid, png_data in cid_images.items():
-            img_part = MIMEImage(png_data, "png")
-            img_part.add_header("Content-ID", f"<{cid}>")
-            img_part.add_header("Content-Disposition", "inline",
-                                filename=f"{cid}.png")
-            msg.attach(img_part)
-
+        msg = build_html_message(subject, self.sender, self.receiver, plain, html, cid_images)
         if cid_images:
             print(f"[Emailer] Embedded {len(cid_images)} LaTeX images as CID")
 
@@ -413,7 +450,7 @@ class Emailer:
                 with smtplib.SMTP_SSL(self.host, self.port) as server:
                     server.login(self.sender, self.password)
                     server.sendmail(self.sender, self.receiver, msg.as_string())
-                print(f"[Emailer] Sent: {subject}")
+                print(f"[Emailer] Accepted by SMTP: {subject}")
                 return True
             except Exception as e:
                 print(f"[Emailer] Attempt {attempt + 1}/3 failed: {e}")

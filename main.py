@@ -18,7 +18,7 @@ import traceback
 
 from src.runtime import config
 from src.data.database import Database
-from src.api.emailer import Emailer
+from src.api.emailer import Emailer, email_batches
 from src.api.icourse import ICourseClient
 from src.pipeline.lecture_runner import LectureRunner
 from src.runtime.reporter import Reporter
@@ -229,10 +229,13 @@ def _send_email(client: ICourseClient, emailer: Emailer | None, db: Database,
         return
     try:
         reporter.email_summary(len(email_items))
-        if emailer.send(email_items):
-            db.mark_emailed_batch([item["sub_id"] for item in email_items])
-        else:
-            reporter.email_failed()
+        batches = email_batches(email_items)
+        for number, batch in enumerate(batches, 1):
+            suffix = f" ({number}/{len(batches)})" if len(batches) > 1 else ""
+            if not emailer.send(batch, subject_suffix=suffix):
+                reporter.email_failed()
+                return
+            db.mark_emailed_batch([item["sub_id"] for item in batch])
     except Exception:
         reporter.info("[Email] Failed to send:")
         traceback.print_exc()

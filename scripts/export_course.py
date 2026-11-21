@@ -27,7 +27,6 @@ import smtplib
 import sys
 from email import encoders
 from email.mime.base import MIMEBase
-from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr
@@ -38,7 +37,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.runtime import config
 from src.data.database import Database  # noqa: E402
-from src.api.emailer import _EMAIL_CSS, _PYGMENTS_CSS, _md_to_html  # noqa: E402
+from src.api.emailer import (  # noqa: E402
+    _EMAIL_CSS, _PYGMENTS_CSS, _md_to_html, build_html_message, email_batches,
+)
 
 # Override hardcoded pixel dimensions for PDF rendering.
 # WeasyPrint maps CSS px to physical size at 96 DPI, which makes the
@@ -114,24 +115,8 @@ def _send_html_email(subject: str, html: str, plain: str,
     CID image references in the HTML resolve correctly, matching the MIME
     structure used in the main programme (``src/emailer.py``).
     """
-    msg = MIMEMultipart("related")
-    msg["Subject"] = subject
-    msg["From"] = formataddr(("iCourse Subscriber", config.SMTP_EMAIL))
-    msg["To"] = config.RECEIVER_EMAIL
-
-    msg_alt = MIMEMultipart("alternative")
-    msg_alt.attach(MIMEText(plain, "plain", "utf-8"))
-    msg_alt.attach(MIMEText(html, "html", "utf-8"))
-    msg.attach(msg_alt)
-
-    if cid_images:
-        for cid, png_data in cid_images.items():
-            img_part = MIMEImage(png_data, "png")
-            img_part.add_header("Content-ID", f"<{cid}>")
-            img_part.add_header("Content-Disposition", "inline",
-                                filename=f"{cid}.png")
-            msg.attach(img_part)
-
+    msg = build_html_message(subject, config.SMTP_EMAIL, config.RECEIVER_EMAIL,
+                             plain, html, cid_images or {})
     with _smtp_connect() as server:
         server.sendmail(config.SMTP_EMAIL, config.RECEIVER_EMAIL, msg.as_string())
 
@@ -346,18 +331,20 @@ def main():
                 continue
             course_title, teacher, lectures = result
 
-            cid_images: dict[str, bytes] = {}
-            html = _build_html(course_title, teacher, lectures,
-                               cid_images=cid_images)
-            plain = _build_plain(course_title, teacher, lectures)
-            subject = f"[iCourse 课程摘要导出] {course_title}"
+            batches = email_batches(lectures)
+            for number, batch in enumerate(batches, 1):
+                cid_images: dict[str, bytes] = {}
+                html = _build_html(course_title, teacher, batch, cid_images=cid_images)
+                plain = _build_plain(course_title, teacher, batch)
+                subject = f"[iCourse 课程摘要导出] {course_title}"
+                if len(batches) > 1:
+                    subject += f" ({number}/{len(batches)})"
 
-            print(f"Sending HTML email for {course_title}...")
-            if cid_images:
-                print(f"  Embedded {len(cid_images)} LaTeX image(s) as CID")
-            _send_html_email(subject, html, plain, cid_images=cid_images)
-            print(f"[OK] Sent: {subject}")
-            sent += 1
+                print(f"Submitting {len(batch)} lecture(s) for {course_title} "
+                      f"with {len(cid_images)} inline image(s)...")
+                _send_html_email(subject, html, plain, cid_images=cid_images)
+                print(f"[OK] Accepted by SMTP: {subject}")
+                sent += 1
 
         if sent == 0:
             print("No courses with summaries found – nothing to send.")
