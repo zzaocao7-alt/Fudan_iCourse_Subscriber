@@ -135,6 +135,9 @@ def _enumerate_lectures(client: ICourseClient, db: Database,
 
             for lecture in new_lectures:
                 sub_id = str(lecture["sub_id"])
+                # Check current access before queuing slides, captions or audio.
+                if client.get_sub_info(course_id, sub_id) is None:
+                    continue
                 db.insert_lecture(
                     sub_id, course_id,
                     lecture.get("sub_title", ""),
@@ -199,24 +202,30 @@ def _drive_lectures(client: ICourseClient, db: Database,
             scheduler.audio_downloader.release(sub_id)
 
 
-def _send_email(emailer: Emailer | None, db: Database, reporter: Reporter,
-                email_items: list) -> None:
+def _send_email(client: ICourseClient, emailer: Emailer | None, db: Database,
+                reporter: Reporter, email_items: list) -> None:
     """Append any previously-processed-but-unsent lectures, then send."""
-    unsent = db.get_unsent_lectures()
-    if unsent:
-        seen_sub_ids = {item["sub_id"] for item in email_items}
-        for row in unsent:
-            if row["sub_id"] not in seen_sub_ids:
-                email_items.append({
-                    "sub_id": row["sub_id"],
-                    "course_title": row["course_title"],
-                    "sub_title": row["sub_title"],
-                    "date": row["date"],
-                    "summary": row["summary"],
-                })
-        reporter.email_recovered_unsent(len(unsent))
-
-    if not (emailer and email_items):
+    if not emailer:
+        return
+    seen_sub_ids = {item["sub_id"] for item in email_items}
+    recovered = 0
+    for row in db.get_unsent_lectures():
+        if row["sub_id"] in seen_sub_ids:
+            continue
+        # Cached summaries may have been created under an older access decision.
+        if client.get_sub_info(row["course_id"], row["sub_id"]) is None:
+            continue
+        email_items.append({
+            "sub_id": row["sub_id"],
+            "course_title": row["course_title"],
+            "sub_title": row["sub_title"],
+            "date": row["date"],
+            "summary": row["summary"],
+        })
+        recovered += 1
+    if recovered:
+        reporter.email_recovered_unsent(recovered)
+    if not email_items:
         return
     try:
         reporter.email_summary(len(email_items))
@@ -338,7 +347,7 @@ def run():
     finally:
         scheduler.shutdown()
 
-    _send_email(emailer, db, reporter, email_items)
+    _send_email(client, emailer, db, reporter, email_items)
     reporter.run_footer()
 
 

@@ -413,12 +413,10 @@ class ICourseClient:
         )
 
     def get_sub_detail(self, course_id: str, sub_id: str) -> dict:
-        """Get detailed info for a specific lecture (unsigned URL).
+        """Return lecture metadata only when iCourse confirms playback access."""
+        if self.get_sub_info(course_id, sub_id) is None:
+            raise RuntimeError("iCourse has not confirmed playback access")
 
-        Returns the full sub-detail data from the API.
-        Note: The video URL returned here is NOT signed for CDN auth.
-        Use get_sub_info() instead for a signed/downloadable URL.
-        """
         url = f"{self.base_url}/courseapi/v3/multi-search/get-sub-detail"
         resp = self.vpn.get(url, params={
             "course_id": course_id, "sub_id": sub_id
@@ -433,59 +431,43 @@ class ICourseClient:
 
         return data.get("data", {})
 
-    def get_sub_info(self, course_id: str, sub_id: str) -> dict:
-        """Get lecture info including video URLs and timestamp.
+    def get_sub_info(self, course_id: str, sub_id: str) -> dict | None:
+        """Return playback information only after an explicit API success.
 
-        Returns the data payload from the API.
-
-        Non-zero API codes that still ship a populated data payload
-        (notably 7001 "视频未到开放时间", the school's 24h pre-release
-        review gate) are returned as partial data so the caller can
-        extract the video URL from nested content.playback.url — the
-        gate scrubs top-level video_list/playurl but not the nested
-        URL.  Only raises on HTTP failure or an entirely empty payload.
+        Missing, denied and temporarily unverifiable lectures are deferred.
         """
         url = (
             f"{self.base_url}"
             f"/courseapi/v3/portal-home-setting/get-sub-info"
         )
-        resp = self.vpn.get(url, params={
-            "course_id": course_id, "sub_id": sub_id
-        })
-        resp.raise_for_status()
-        data = resp.json()
-        payload = data.get("data") or {}
+        try:
+            response = self.vpn.get(url, params={
+                "course_id": course_id, "sub_id": sub_id,
+            })
+            response.raise_for_status()
+            result = response.json()
+        except Exception as error:
+            print(f"    [Playback] Deferring {sub_id}: {type(error).__name__}.",
+                  flush=True)
+            return None
 
-        if data.get("code") != 0 and not payload:
-            raise RuntimeError(
-                f"API error for sub-info {sub_id}: {data.get('msg')}"
-            )
-
-        return payload
+        code = result.get("code") if isinstance(result, dict) else None
+        if str(code) != "0":
+            print(f"    [Playback] Deferring {sub_id}: iCourse status {code}.",
+                  flush=True)
+            return None
+        info = result.get("data")
+        if not isinstance(info, dict) or not info:
+            print(f"    [Playback] Deferring {sub_id}: no playback information.",
+                  flush=True)
+            return None
+        return info
 
     def get_video_url(self, course_id: str, sub_id: str) -> str | None:
-        """Get a signed MP4 video URL for a specific lecture.
-
-        Cascades through URL sources, most- to least-preferred:
-          1. info.video_list[*].preview_url     — healthy lecture
-          2. info.playurl[*]                    — healthy alternate
-          3. info.content.playback.url          — review-gated (no extra call)
-          4. get-sub-detail content.playback.url — last resort
-
-        Sources 3 and 4 cover the school's pre-release review gate
-        (sub-info code 7001 "视频未到开放时间"), which scrubs top-level
-        video_list/playurl but leaves the URL in nested fields.  The
-        CDN itself does not enforce the gate, so a signed URL from
-        either source downloads successfully.
-
-        Returns the signed video URL string, or None if no source yields one.
-        """
-        try:
-            info = self.get_sub_info(course_id, sub_id)
-        except Exception as e:
-            print(f"    sub-info unavailable for {sub_id} "
-                  f"({type(e).__name__}); falling back to sub-detail")
-            info = {}
+        """Select a published stream from the current user's playback response."""
+        info = self.get_sub_info(course_id, sub_id)
+        if info is None:
+            return None
 
         # Get server timestamp for signing
         now = info.get("now")
@@ -516,32 +498,8 @@ class ICourseClient:
                         base_url = v
                         break
 
-        # Review-gate fallback: nested content.playback.url is preserved
-        # even when code == 7001 scrubs the top-level fields above.
         if not base_url:
-            playback = (info.get("content") or {}).get("playback") or {}
-            nested = playback.get("url")
-            if isinstance(nested, str) and nested.endswith(".mp4"):
-                base_url = nested
-                if not now:
-                    content_now = (info.get("content") or {}).get("now")
-                    if isinstance(content_now, (int, str)):
-                        now = int(content_now)
-
-        # Last resort: hit get-sub-detail (gate-free) directly.
-        if not base_url:
-            try:
-                detail = self.get_sub_detail(course_id, sub_id)
-                content = detail.get("content", {})
-                playback = content.get("playback", {})
-                if playback and playback.get("url"):
-                    base_url = playback["url"]
-            except Exception:
-                pass
-
-        if not base_url:
-            print(f"    No video URL found for {sub_id} (tried video_list, "
-                  f"playurl, content.playback, sub_detail)")
+            print(f"    No published video URL for {sub_id}.", flush=True)
             return None
 
         return self.sign_video_url(base_url, now=now)
